@@ -68,7 +68,7 @@ function renderHeader() {
   console.log(
     chalk.cyan.bold(" │") +
       chalk.white.bold("  🔊 Port Whisperer") +
-      "                 " +
+      "                  " +
       chalk.cyan.bold("│"),
   );
   console.log(
