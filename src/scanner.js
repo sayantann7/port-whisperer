@@ -1,74 +1,14 @@
 import { execSync } from "child_process";
 import { existsSync, readFileSync } from "fs";
 import { join, dirname, basename } from "path";
-
-/**
- * Batch-fetch ps info for all PIDs in one call
- * Returns Map<pid, { ppid, stat, rss, lstart, command }>
- */
-function batchPsInfo(pids) {
-  const map = new Map();
-  if (pids.length === 0) return map;
-
-  try {
-    const pidList = pids.join(",");
-    const raw = execSync(
-      `ps -p ${pidList} -o pid=,ppid=,stat=,rss=,lstart=,command= 2>/dev/null`,
-      {
-        encoding: "utf8",
-        timeout: 5000,
-      },
-    ).trim();
-
-    for (const line of raw.split("\n")) {
-      if (!line.trim()) continue;
-      // Format: PID PPID STAT RSS DOW MON DD HH:MM:SS YYYY COMMAND...
-      const m = line
-        .trim()
-        .match(
-          /^(\d+)\s+(\d+)\s+(\S+)\s+(\d+)\s+\w+\s+(\w+\s+\d+\s+[\d:]+\s+\d+)\s+(.*)$/,
-        );
-      if (!m) continue;
-      map.set(parseInt(m[1], 10), {
-        ppid: parseInt(m[2], 10),
-        stat: m[3],
-        rss: parseInt(m[4], 10),
-        lstart: m[5],
-        command: m[6],
-      });
-    }
-  } catch {}
-  return map;
-}
-
-/**
- * Batch-fetch cwd for all PIDs via a single lsof call
- * Returns Map<pid, cwdPath>
- */
-function batchCwd(pids) {
-  const map = new Map();
-  if (pids.length === 0) return map;
-
-  try {
-    const pidList = pids.join(",");
-    const raw = execSync(`lsof -a -d cwd -p ${pidList} 2>/dev/null`, {
-      encoding: "utf8",
-      timeout: 10000,
-    }).trim();
-
-    const lines = raw.split("\n").slice(1); // skip header
-    for (const line of lines) {
-      const parts = line.split(/\s+/);
-      if (parts.length < 9) continue;
-      const pid = parseInt(parts[1], 10);
-      const path = parts.slice(8).join(" ");
-      if (path && path.startsWith("/")) {
-        map.set(pid, path);
-      }
-    }
-  } catch {}
-  return map;
-}
+import {
+  getListeningPortsRaw,
+  batchProcessInfo,
+  batchCwd,
+  getAllProcessesRaw,
+  getProcessTree as platformGetProcessTree,
+  getPlatform,
+} from "./platform/index.js";
 
 /**
  * Batch-fetch docker container info mapped by host port.
@@ -76,12 +16,16 @@ function batchCwd(pids) {
  */
 function batchDockerInfo() {
   const map = new Map();
+  const isWindows = getPlatform() === "win32";
+  const nullDevice = isWindows ? "NUL" : "/dev/null";
+  
   try {
     const raw = execSync(
-      'docker ps --format "{{.Ports}}\\t{{.Names}}\\t{{.Image}}" 2>/dev/null',
+      `docker ps --format "{{.Ports}}\t{{.Names}}\t{{.Image}}" 2>${nullDevice}`,
       {
         encoding: "utf8",
         timeout: 5000,
+        windowsHide: true,
       },
     ).trim();
 
@@ -112,42 +56,14 @@ function batchDockerInfo() {
  * When detailed=false (default for table view), skips expensive per-process lookups.
  */
 export function getListeningPorts(detailed = false) {
-  let raw;
-  try {
-    raw = execSync("lsof -iTCP -sTCP:LISTEN -P -n 2>/dev/null", {
-      encoding: "utf8",
-      timeout: 10000,
-    });
-  } catch {
-    return [];
-  }
-
-  const lines = raw.trim().split("\n").slice(1);
-  const portMap = new Map();
-  const entries = [];
-
-  for (const line of lines) {
-    const parts = line.split(/\s+/);
-    if (parts.length < 9) continue;
-
-    const processName = parts[0];
-    const pid = parseInt(parts[1], 10);
-    const nameField = parts[8];
-
-    const portMatch = nameField.match(/:(\d+)$/);
-    if (!portMatch) continue;
-    const port = parseInt(portMatch[1], 10);
-
-    if (portMap.has(port)) continue;
-    portMap.set(port, true);
-    entries.push({ port, pid, processName });
-  }
+  const entries = getListeningPortsRaw();
+  if (entries.length === 0) return [];
 
   // Deduplicate PIDs for batch calls
   const uniquePids = [...new Set(entries.map((e) => e.pid))];
 
   // Batch calls instead of N*6 individual calls
-  const psMap = batchPsInfo(uniquePids);
+  const psMap = batchProcessInfo(uniquePids);
   const cwdMap = batchCwd(uniquePids);
   const hasDocker = entries.some(
     (e) => e.processName.startsWith("com.docke") || e.processName === "docker",
@@ -213,11 +129,14 @@ export function getListeningPorts(detailed = false) {
 
       if (detailed) {
         try {
+          const isWindows = getPlatform() === "win32";
+          const nullDevice = isWindows ? "NUL" : "/dev/null";
           info.gitBranch = execSync(
-            `git -C "${info.cwd}" rev-parse --abbrev-ref HEAD 2>/dev/null`,
+            `git -C "${info.cwd}" rev-parse --abbrev-ref HEAD 2>${nullDevice}`,
             {
               encoding: "utf8",
               timeout: 3000,
+              windowsHide: true,
             },
           ).trim();
         } catch {}
@@ -226,7 +145,7 @@ export function getListeningPorts(detailed = false) {
 
     // Process tree only in detailed mode
     if (detailed) {
-      info.processTree = getProcessTree(pid);
+      info.processTree = platformGetProcessTree(pid);
     }
 
     return info;
@@ -236,7 +155,7 @@ export function getListeningPorts(detailed = false) {
 }
 
 /**
- * Check if a process looks like a dev server vs a regular macOS/system app.
+ * Check if a process looks like a dev server vs a regular system app.
  * Used for orphan detection and filtering the table view.
  */
 export function isDevProcess(processName, command) {
@@ -244,28 +163,31 @@ export function isDevProcess(processName, command) {
   const cmd = (command || "").toLowerCase();
 
   // Known system/desktop apps — not dev processes
+  // Includes macOS, Windows, and Linux system processes
   const systemApps = [
+    // Cross-platform apps
     "spotify",
-    "raycast",
     "tableplus",
     "postman",
     "linear",
     "cursor",
-    "controlce",
-    "rapportd",
-    "superhuma",
-    "setappage",
     "slack",
     "discord",
     "firefox",
     "chrome",
     "google",
-    "safari",
     "figma",
     "notion",
     "zoom",
     "teams",
     "code",
+    // macOS specific
+    "raycast",
+    "controlce",
+    "rapportd",
+    "superhuma",
+    "setappage",
+    "safari",
     "iterm2",
     "warp",
     "arc",
@@ -285,6 +207,81 @@ export function isDevProcess(processName, command) {
     "usernoted",
     "notificationc",
     "cloudd",
+    // Windows specific
+    "system",
+    "svchost",
+    "csrss",
+    "wininit",
+    "services",
+    "lsass",
+    "smss",
+    "explorer",
+    "dwm",
+    "taskhostw",
+    "runtimebroker",
+    "searchhost",
+    "startmenuex",
+    "shellexper",
+    "sihost",
+    "ctfmon",
+    "fontdrvhost",
+    "conhost",
+    "dllhost",
+    "searchindex",
+    "securityheal",
+    "msedge",
+    "onedrive",
+    "windowstermi",
+    // Linux specific
+    "systemd",
+    "kthreadd",
+    "ksoftirqd",
+    "kworker",
+    "rcu_sched",
+    "migration",
+    "watchdog",
+    "cpuhp",
+    "netns",
+    "kauditd",
+    "khungtaskd",
+    "oom_reaper",
+    "writeback",
+    "kcompactd",
+    "ksmd",
+    "khugepaged",
+    "kintegrityd",
+    "kblockd",
+    "blkcg_punt",
+    "tpm_dev_wq",
+    "ata_sff",
+    "md",
+    "edac-poller",
+    "devfreq_wq",
+    "watchdogd",
+    "kswapd",
+    "kthrotld",
+    "irq",
+    "acpi_thermal",
+    "nvme-wq",
+    "scsi_eh",
+    "scsi_tmf",
+    "dm_bufio_cac",
+    "jbd2",
+    "ext4-rsv-con",
+    "kstrp",
+    "charger_mana",
+    "cryptd",
+    "gnome-shell",
+    "gdm",
+    "xdg-desktop",
+    "pulseaudio",
+    "pipewire",
+    "dbus-daemon",
+    "gvfsd",
+    "tracker-miner",
+    "evolution-cal",
+    "goa-daemon",
+    "gnome-keyring",
   ];
   for (const app of systemApps) {
     if (name.toLowerCase().startsWith(app)) return false;
@@ -401,11 +398,19 @@ function findProjectRoot(dir) {
   ];
   let current = dir;
   let depth = 0;
-  while (current !== "/" && depth < 15) {
+  const isWindows = getPlatform() === "win32";
+  // Root detection: "/" on Unix, drive letter root on Windows (e.g., "C:\")
+  const isRoot = isWindows
+    ? (path) => /^[A-Za-z]:\\?$/.test(path) || path === dirname(path)
+    : (path) => path === "/";
+  
+  while (!isRoot(current) && depth < 15) {
     for (const marker of markers) {
       if (existsSync(join(current, marker))) return current;
     }
-    current = dirname(current);
+    const parent = dirname(current);
+    if (parent === current) break; // Safety check
+    current = parent;
     depth++;
   }
   return dir;
@@ -490,37 +495,6 @@ function detectFrameworkFromName(processName) {
   return null;
 }
 
-function getProcessTree(pid) {
-  const tree = [];
-  try {
-    // Get all processes in one call and walk the tree in memory
-    const raw = execSync("ps -eo pid=,ppid=,comm= 2>/dev/null", {
-      encoding: "utf8",
-      timeout: 5000,
-    }).trim();
-
-    const processes = new Map();
-    for (const line of raw.split("\n")) {
-      const parts = line.trim().split(/\s+/);
-      if (parts.length < 3) continue;
-      const p = parseInt(parts[0], 10);
-      const pp = parseInt(parts[1], 10);
-      processes.set(p, { pid: p, ppid: pp, name: parts.slice(2).join(" ") });
-    }
-
-    let currentPid = pid;
-    let depth = 0;
-    while (currentPid > 1 && depth < 8) {
-      const proc = processes.get(currentPid);
-      if (!proc) break;
-      tree.push(proc);
-      currentPid = proc.ppid;
-      depth++;
-    }
-  } catch {}
-  return tree;
-}
-
 /**
  * Extract a short, human-readable description from a full command string.
  */
@@ -530,6 +504,7 @@ function summarizeCommand(command, processName) {
   // For scripts with arguments, show the meaningful part
   // e.g. "node /Users/foo/project/server.js --port 3000" -> "server.js"
   // e.g. "/usr/bin/python3 manage.py runserver" -> "manage.py runserver"
+  // Handle both forward slash and backslash for cross-platform
   const parts = cmd.split(/\s+/);
   const meaningful = [];
   for (let i = 0; i < parts.length; i++) {
@@ -538,8 +513,8 @@ function summarizeCommand(command, processName) {
     if (i === 0) continue;
     // Skip flags
     if (part.startsWith("-")) continue;
-    // Get basename of file paths
-    if (part.includes("/")) {
+    // Get basename of file paths (handle both / and \)
+    if (part.includes("/") || part.includes("\\")) {
       meaningful.push(basename(part));
     } else {
       meaningful.push(part);
@@ -558,45 +533,8 @@ function summarizeCommand(command, processName) {
  * Used by `ports ps` command.
  */
 export function getAllProcesses() {
-  let raw;
-  try {
-    raw = execSync(
-      "ps -eo pid=,pcpu=,pmem=,rss=,lstart=,command= 2>/dev/null",
-      { encoding: "utf8", timeout: 5000 },
-    ).trim();
-  } catch {
-    return [];
-  }
-
-  const entries = [];
-  const seen = new Set();
-
-  for (const line of raw.split("\n")) {
-    if (!line.trim()) continue;
-    const m = line
-      .trim()
-      .match(
-        /^(\d+)\s+([\d.]+)\s+([\d.]+)\s+(\d+)\s+\w+\s+(\w+\s+\d+\s+[\d:]+\s+\d+)\s+(.*)$/,
-      );
-    if (!m) continue;
-
-    const pid = parseInt(m[1], 10);
-    if (pid <= 1 || pid === process.pid || seen.has(pid)) continue;
-    seen.add(pid);
-
-    const command = m[6];
-    const processName = basename(command.split(/\s+/)[0]);
-
-    entries.push({
-      pid,
-      processName,
-      cpu: parseFloat(m[2]),
-      memPercent: parseFloat(m[3]),
-      rss: parseInt(m[4], 10),
-      lstart: m[5],
-      command,
-    });
-  }
+  const entries = getAllProcessesRaw();
+  if (entries.length === 0) return [];
 
   // Batch cwd lookup — only for non-Docker processes (Docker cwd is useless)
   const nonDockerEntries = entries.filter(

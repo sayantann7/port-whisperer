@@ -153,8 +153,17 @@ Framework detection reads `package.json` dependencies and inspects process comma
 | Platform | Status |
 |----------|--------|
 | macOS    | Supported |
-| Linux    | Planned |
-| Windows  | Not planned |
+| Linux    | Supported |
+| Windows  | Supported |
+
+### Platform notes
+
+- **macOS**: Uses `lsof` and `ps` commands for port and process detection
+- **Linux**: Uses `ss` (or `netstat` fallback) and `/proc` filesystem
+- **Windows**: Uses `netstat` and `wmic` commands
+- **Docker**: Works cross-platform when Docker is installed
+
+> **Note**: On Linux, some process information may require root/sudo access for full visibility. On Windows, process working directory detection is limited.
 
 ## License
 
